@@ -183,7 +183,8 @@ You can deeply customize the feel and pacing of every animation via the Windhawk
   * *Performance Tip:* The 1 px setting uses specialized single-pixel paths, but maximized windows can still be demanding when an app must fall back to CPU rendering. Around 5 px is a better balance for those windows. Values from 2–4 create dense quad fields, while larger values (24, 32) yield a stylish retro pixelated effect and perform effortlessly on most hardware. (Clamped strictly to 1-100).
 * **Animate app launches:** Off by default. Enable it to use the restore effect when an application window first opens.
 * **Animate windows hidden to the tray:** Off by default. Enable it to animate apps such as Discord, Steam, and Telegram when they hide their window instead of closing it. This can also animate splash screens or windows hidden automatically by an app.
-* **Toggles:** Individually turn on/off Minimize, Restore, Close, Alt+Tab Switch, and Launch animations to suit your workflow.
+* **Toggles:** Individually turn on/off Minimize, Restore, Maximize, Close, Alt+Tab Switch, and Launch animations to suit your workflow.
+* **Smooth maximize and unmaximize:** Optionally animate normal windows as they expand to their maximized bounds or return to their previous size. The effect uses a click-through DWM thumbnail on a worker thread, so the application keeps processing messages throughout the transition.
 * **Taskbar placement:** Bottom, top, left, and right taskbars are supported, including taskbars on secondary monitors and auto-hidden taskbars. Genie bends toward the detected edge and targets the app button on that axis; Windows 10 scales toward the full button position. The other minimize/restore effects animate in place, while **None** continues to use Windows' native transition.
 * **Rounded corners:** Minimize, restore, and launch effects preserve Windows 11's rounded window silhouette. Maximized windows and apps that explicitly request square corners stay square. This does not add a synthetic window shadow.
 * **Hybrid GPU acceleration:** Separate toggles allow the mod to use GPU rendering where it is measurably beneficial. The minimize/restore toggle accelerates restores and launches; normal minimizes intentionally remain on CPU. The close toggle accelerates only sufficiently large 1 px Thanos/Perlin workloads; ordinary close effects remain on CPU. Turn a toggle off to force that whole group to CPU. See **Why 1.3.5 uses a hybrid renderer** above for the complete routing rules and fallbacks.
@@ -263,6 +264,17 @@ You can deeply customize the feel and pacing of every animation via the Windhawk
       CPU for the entire group. See the mod README for the full routing details.
   $name: Minimize, restore, and launch
   $description: Configure animations for minimizing, restoring, and opening windows.
+- maximize_restore:
+  - maximize_animation: false
+    $name: Animate maximizing and unmaximizing
+    $description: >-
+      Animate normal windows as they expand to their maximized bounds or return to their
+      previous size. Disabled by default.
+  - duration_ms: 260
+    $name: Duration (ms)
+    $description: Maximize and unmaximize animation duration, from 120 to 700 ms.
+  $name: Maximize and unmaximize
+  $description: Configure the DWM-thumbnail transition used for window size-state changes.
 - close:
   - close_animation: true
     $name: Animate closing
@@ -366,6 +378,7 @@ You can deeply customize the feel and pacing of every animation via the Windhawk
 #include <sddl.h>
 #include <string_view>
 #include <exception>
+#include <memory>
 #include <new>
 #include <utility>
 #include <windhawk_utils.h>
@@ -389,6 +402,7 @@ using Microsoft::WRL::ComPtr;
 #define ANIM_DEFER_SW_HIDE (WM_APP + 101)
 #define ANIM_PREPARE_SHOW_DESKTOP_RESTORE (WM_APP + 102)
 using DefWindowProcW_t = LRESULT (WINAPI*)(HWND, UINT, WPARAM, LPARAM);
+using DefWindowProcA_t = LRESULT (WINAPI*)(HWND, UINT, WPARAM, LPARAM);
 using ShowWindow_t = BOOL (WINAPI*)(HWND, int);
 using ShowWindowAsync_t = BOOL (WINAPI*)(HWND, int);
 using SetWindowPlacement_t = BOOL (WINAPI*)(HWND, const WINDOWPLACEMENT*);
@@ -397,6 +411,7 @@ using SetWindowPos_t = BOOL (WINAPI*)(HWND, HWND, int, int, int, int, UINT);
 using DestroyWindow_t = BOOL (WINAPI*)(HWND);
 using RaiseDesktop_t = void (__cdecl*)(void*, int);
 DefWindowProcW_t DefWindowProcW_Original;
+DefWindowProcA_t DefWindowProcA_Original;
 ShowWindow_t ShowWindow_Original;
 ShowWindowAsync_t ShowWindowAsync_Original;
 SetWindowPlacement_t SetWindowPlacement_Original;
@@ -766,6 +781,8 @@ std::atomic<bool> g_minRestoreShuffleEffect{false};
 std::atomic<int> g_shatterBlockSize{5};
 std::atomic<bool> g_minimizeAnimation{true};
 std::atomic<bool> g_restoreAnimation{true};
+std::atomic<bool> g_maximizeAnimation{false};
+std::atomic<int> g_maximizeDurationMs{260};
 std::atomic<bool> g_closeAnimation{true};
 std::atomic<bool> g_hideAsClose{false};
 std::atomic<bool> g_launchAnimation{false};
@@ -2584,6 +2601,12 @@ void LoadAnimSettings() {
     }
     g_minimizeAnimation.store(Wh_GetIntSetting(L"minimize_restore.minimize_animation") != 0, std::memory_order_relaxed);
     g_restoreAnimation.store(Wh_GetIntSetting(L"minimize_restore.restore_animation") != 0, std::memory_order_relaxed);
+    g_maximizeAnimation.store(
+        Wh_GetIntSetting(L"maximize_restore.maximize_animation") != 0,
+        std::memory_order_relaxed);
+    g_maximizeDurationMs.store(
+        Clamp(Wh_GetIntSetting(L"maximize_restore.duration_ms"), 120, 700),
+        std::memory_order_relaxed);
     g_closeAnimation.store(Wh_GetIntSetting(L"close.close_animation") != 0, std::memory_order_relaxed);
     g_hideAsClose.store(Wh_GetIntSetting(L"close.hide_as_close") != 0, std::memory_order_relaxed);
     g_launchAnimation.store(Wh_GetIntSetting(L"minimize_restore.launch_animation") != 0, std::memory_order_relaxed);
@@ -12366,6 +12389,310 @@ static bool IsShellTaskbarRestoreCall(HWND hWnd) {
         MonitorFromWindow(hWnd, MONITOR_DEFAULTTONEAREST));
     return hTray && IsCursorOverTaskbar(hTray);
 }
+
+struct PendingResizeAnimation {
+    HWND hWnd{};
+    RECT fromRect{};
+    int durationMs{};
+    bool active{};
+};
+
+struct ResizeAnimationData {
+    HWND hWnd{};
+    RECT fromRect{};
+    RECT toRect{};
+    int durationMs{};
+};
+
+static bool GetMaximizeAnimationRect(HWND hWnd, RECT* rect) {
+    if (!hWnd || !rect) return false;
+
+    if (FAILED(DwmGetWindowAttribute(
+            hWnd, DWMWA_EXTENDED_FRAME_BOUNDS, rect, sizeof(*rect))) &&
+        !GetWindowRectInDpiContext(
+            hWnd, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, rect)) {
+        return false;
+    }
+
+    return rect->right > rect->left && rect->bottom > rect->top;
+}
+
+static RECT UnionResizeRects(const RECT& left, const RECT& right) {
+    return {
+        std::min(left.left, right.left),
+        std::min(left.top, right.top),
+        std::max(left.right, right.right),
+        std::max(left.bottom, right.bottom),
+    };
+}
+
+static RECT MakeResizeRectLocal(const RECT& rect, const RECT& origin) {
+    return {
+        rect.left - origin.left,
+        rect.top - origin.top,
+        rect.right - origin.left,
+        rect.bottom - origin.top,
+    };
+}
+
+static RECT InterpolateResizeRect(const RECT& fromRect,
+                                  const RECT& toRect,
+                                  float amount) {
+    const auto lerp = [amount](LONG from, LONG to) {
+        return static_cast<LONG>(
+            lround(from + (to - from) * amount));
+    };
+    return {
+        lerp(fromRect.left, toRect.left),
+        lerp(fromRect.top, toRect.top),
+        lerp(fromRect.right, toRect.right),
+        lerp(fromRect.bottom, toRect.bottom),
+    };
+}
+
+static float EaseResizeAnimation(float progress) {
+    progress = std::clamp(progress, 0.0f, 1.0f);
+    if (progress < 0.5f) {
+        return 4.0f * progress * progress * progress;
+    }
+    const float t = -2.0f * progress + 2.0f;
+    return 1.0f - (t * t * t) / 2.0f;
+}
+
+static void PumpResizeAnimationMessages() {
+    MSG message;
+    while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+}
+
+static DWORD WINAPI ResizeAnimationThread(void* parameter) {
+    std::unique_ptr<ResizeAnimationData> data(
+        static_cast<ResizeAnimationData*>(parameter));
+    const HWND hWnd = data->hWnd;
+
+    struct AnimationCleanup {
+        HWND hWnd;
+        bool windowRestored{};
+        ~AnimationCleanup() {
+            if (!windowRestored && IsWindow(hWnd)) {
+                SetWindowCloak(hWnd, FALSE);
+            }
+            std::lock_guard<std::mutex> lock(g_StateMutex);
+            g_AnimActive.erase(hWnd);
+        }
+    } cleanup{hWnd};
+
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+    const DPI_AWARENESS_CONTEXT previousDpiContext =
+        SetThreadDpiAwarenessContext(
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (!previousDpiContext) return 0;
+
+    struct DpiContextCleanup {
+        DPI_AWARENESS_CONTEXT previous;
+        ~DpiContextCleanup() {
+            SetThreadDpiAwarenessContext(previous);
+        }
+    } dpiCleanup{previousDpiContext};
+
+    const RECT ghostRect = UnionResizeRects(data->fromRect, data->toRect);
+    const int ghostWidth = ghostRect.right - ghostRect.left;
+    const int ghostHeight = ghostRect.bottom - ghostRect.top;
+    if (ghostWidth <= 0 || ghostHeight <= 0 ||
+        g_unloading.load(std::memory_order_relaxed) || !IsWindow(hWnd)) {
+        return 0;
+    }
+
+    HWND ghost = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST |
+            WS_EX_NOACTIVATE | WS_EX_TRANSPARENT |
+            WS_EX_NOREDIRECTIONBITMAP,
+        L"STATIC", nullptr, WS_POPUP, ghostRect.left, ghostRect.top,
+        ghostWidth, ghostHeight, nullptr, nullptr, nullptr, nullptr);
+    if (!ghost) return 0;
+
+    HTHUMBNAIL thumbnail = nullptr;
+    if (FAILED(DwmRegisterThumbnail(ghost, hWnd, &thumbnail))) {
+        DestroyWindow_Original(ghost);
+        return 0;
+    }
+
+    DWM_THUMBNAIL_PROPERTIES properties{};
+    properties.dwFlags =
+        DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY;
+    properties.fVisible = TRUE;
+    properties.opacity = 255;
+    properties.rcDestination =
+        MakeResizeRectLocal(data->fromRect, ghostRect);
+
+    bool thumbnailReady = SUCCEEDED(
+        DwmUpdateThumbnailProperties(thumbnail, &properties));
+    if (thumbnailReady) {
+        ShowWindow_Original(ghost, SW_SHOWNOACTIVATE);
+        PumpResizeAnimationMessages();
+        FlushDwmOrYield();
+
+        LARGE_INTEGER frequency{};
+        LARGE_INTEGER start{};
+        LARGE_INTEGER now{};
+        QueryPerformanceFrequency(&frequency);
+        QueryPerformanceCounter(&start);
+
+        for (;;) {
+            PumpResizeAnimationMessages();
+            QueryPerformanceCounter(&now);
+            const double elapsedMs =
+                (now.QuadPart - start.QuadPart) * 1000.0 /
+                frequency.QuadPart;
+            const bool lastFrame =
+                elapsedMs >= data->durationMs ||
+                g_unloading.load(std::memory_order_relaxed) ||
+                !IsWindow(hWnd);
+            const float progress =
+                lastFrame
+                    ? 1.0f
+                    : static_cast<float>(elapsedMs / data->durationMs);
+            properties.rcDestination = MakeResizeRectLocal(
+                InterpolateResizeRect(data->fromRect, data->toRect,
+                                      EaseResizeAnimation(progress)),
+                ghostRect);
+
+            if (FAILED(DwmUpdateThumbnailProperties(thumbnail,
+                                                    &properties)) ||
+                lastFrame) {
+                break;
+            }
+            FlushDwmOrYield();
+        }
+    }
+
+    if (IsWindow(hWnd)) {
+        SetWindowCloak(hWnd, FALSE);
+    }
+    cleanup.windowRestored = true;
+    PumpResizeAnimationMessages();
+    FlushDwmOrYield();
+
+    DwmUnregisterThumbnail(thumbnail);
+    DestroyWindow_Original(ghost);
+    PumpResizeAnimationMessages();
+    return 0;
+}
+
+static bool IsResizeAnimationCommand(HWND hWnd, int command,
+                                     bool* maximizing) {
+    const bool maximize =
+        command == SW_SHOWMAXIMIZED && !IsZoomed(hWnd) && !IsIconic(hWnd);
+    const bool unmaximize =
+        (command == SW_RESTORE || command == SW_SHOWNORMAL) &&
+        IsZoomed(hWnd) && !IsIconic(hWnd);
+    if (maximizing) *maximizing = maximize;
+    return maximize || unmaximize;
+}
+
+static bool PrepareResizeAnimation(HWND hWnd,
+                                   PendingResizeAnimation* pending) {
+    if (!pending ||
+        !g_maximizeAnimation.load(std::memory_order_relaxed) ||
+        g_unloading.load(std::memory_order_relaxed) ||
+        !IsOurWindow(hWnd) || !IsAppMainWindow(hWnd)) {
+        return false;
+    }
+
+    RECT fromRect{};
+    if (!GetMaximizeAnimationRect(hWnd, &fromRect)) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        if (g_unloading.load(std::memory_order_relaxed) ||
+            g_AnimActive.count(hWnd)) {
+            return false;
+        }
+        try {
+            g_AnimActive.insert(hWnd);
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+
+    BOOL cloak = TRUE;
+    if (FAILED(DwmSetWindowAttribute(
+            hWnd, DWMWA_CLOAK, &cloak, sizeof(cloak)))) {
+        std::lock_guard<std::mutex> lock(g_StateMutex);
+        g_AnimActive.erase(hWnd);
+        return false;
+    }
+    FlushDwmOrYield();
+
+    pending->hWnd = hWnd;
+    pending->fromRect = fromRect;
+    pending->durationMs =
+        g_maximizeDurationMs.load(std::memory_order_relaxed);
+    pending->active = true;
+    return true;
+}
+
+static void CancelResizeAnimation(PendingResizeAnimation* pending) {
+    if (!pending || !pending->active) return;
+    pending->active = false;
+    if (IsWindow(pending->hWnd)) {
+        SetWindowCloak(pending->hWnd, FALSE);
+    }
+    std::lock_guard<std::mutex> lock(g_StateMutex);
+    g_AnimActive.erase(pending->hWnd);
+}
+
+static void CommitResizeAnimation(PendingResizeAnimation* pending,
+                                  bool maximizing) {
+    if (!pending || !pending->active) return;
+
+    RECT toRect{};
+    if (g_unloading.load(std::memory_order_relaxed) ||
+        !IsWindow(pending->hWnd) ||
+        !GetMaximizeAnimationRect(pending->hWnd, &toRect) ||
+        EqualRect(&pending->fromRect, &toRect)) {
+        CancelResizeAnimation(pending);
+        return;
+    }
+
+    auto* data = new (std::nothrow) ResizeAnimationData{
+        pending->hWnd, pending->fromRect, toRect, pending->durationMs};
+    if (!data || !StartWorkerThread(ResizeAnimationThread, data)) {
+        delete data;
+        CancelResizeAnimation(pending);
+        return;
+    }
+
+    if (IsDiagnosticLoggingEnabled()) {
+        Wh_Log(L"%s animation start hwnd=%p duration=%d",
+               maximizing ? L"Maximize" : L"Unmaximize", pending->hWnd,
+               pending->durationMs);
+    }
+    pending->active = false;
+}
+
+static bool TryHandleResizeSysCommand(
+    HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam,
+    LRESULT(WINAPI* original)(HWND, UINT, WPARAM, LPARAM),
+    LRESULT* result) {
+    if (msg != WM_SYSCOMMAND || !result) return false;
+
+    const UINT command = static_cast<UINT>(wParam) & 0xFFF0;
+    const bool maximizing =
+        command == SC_MAXIMIZE && !IsZoomed(hWnd) && !IsIconic(hWnd);
+    const bool unmaximizing =
+        command == SC_RESTORE && IsZoomed(hWnd) && !IsIconic(hWnd);
+    if (!maximizing && !unmaximizing) return false;
+
+    PendingResizeAnimation pending{};
+    if (!PrepareResizeAnimation(hWnd, &pending)) return false;
+    *result = original(hWnd, msg, wParam, lParam);
+    CommitResizeAnimation(&pending, maximizing);
+    return true;
+}
+
 BOOL WINAPI ShowWindow_Hook(HWND hWnd, int cmd) {
     const bool restoreCommand = cmd == SW_RESTORE || cmd == SW_SHOWNORMAL;
     if (restoreCommand && g_showDesktopNativeRestoreDepth) {
@@ -12455,6 +12782,11 @@ BOOL WINAPI ShowWindow_Hook(HWND hWnd, int cmd) {
         return IsWindowVisible(hWnd);
     }
     if (!IsOurWindow(hWnd)) return ShowWindow_Original(hWnd, cmd);
+    bool maximizing = false;
+    PendingResizeAnimation resizeAnimation{};
+    if (IsResizeAnimationCommand(hWnd, cmd, &maximizing)) {
+        PrepareResizeAnimation(hWnd, &resizeAnimation);
+    }
     const bool mayCreateStableWindow =
         !IsWindowVisible(hWnd) && IsLaunchCommand(cmd);
     if (IsShowCmdForWinEvent(cmd)) {
@@ -12478,6 +12810,13 @@ BOOL WINAPI ShowWindow_Hook(HWND hWnd, int cmd) {
         return result;
     }
     const BOOL result = ShowWindow_Original(hWnd, cmd);
+    if (resizeAnimation.active) {
+        if (result) {
+            CommitResizeAnimation(&resizeAnimation, maximizing);
+        } else {
+            CancelResizeAnimation(&resizeAnimation);
+        }
+    }
     if (mayCreateStableWindow) ScheduleStableGpuWarmup();
     return result;
 }
@@ -12765,8 +13104,27 @@ LRESULT WINAPI DefWindowProcW_Hook(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lP
             }
         }
     }
+    LRESULT resizeResult = 0;
+    if (TryHandleResizeSysCommand(hWnd, msg, wParam, lParam,
+                                  DefWindowProcW_Original,
+                                  &resizeResult)) {
+        return resizeResult;
+    }
     return DefWindowProcW_Original(hWnd, msg, wParam, lParam);
 }
+
+LRESULT WINAPI DefWindowProcA_Hook(HWND hWnd, UINT msg, WPARAM wParam,
+                                   LPARAM lParam) {
+    LRESULT resizeResult = 0;
+    if (IsOurWindow(hWnd) &&
+        TryHandleResizeSysCommand(hWnd, msg, wParam, lParam,
+                                  DefWindowProcA_Original,
+                                  &resizeResult)) {
+        return resizeResult;
+    }
+    return DefWindowProcA_Original(hWnd, msg, wParam, lParam);
+}
+
 BOOL WINAPI SetWindowPlacement_Hook(HWND hWnd, const WINDOWPLACEMENT* placement) {
     const bool restoreCommand =
         placement && (placement->showCmd == SW_RESTORE ||
@@ -12841,6 +13199,12 @@ BOOL WINAPI SetWindowPlacement_Hook(HWND hWnd, const WINDOWPLACEMENT* placement)
         return result;
     }
     if (!IsOurWindow(hWnd)) return SetWindowPlacement_Original(hWnd, placement);
+    bool maximizing = false;
+    PendingResizeAnimation resizeAnimation{};
+    if (placement &&
+        IsResizeAnimationCommand(hWnd, placement->showCmd, &maximizing)) {
+        PrepareResizeAnimation(hWnd, &resizeAnimation);
+    }
     if (placement && placement->showCmd == SW_HIDE && !GetPropW(hWnd, kPropCloseBypass) &&
         ShouldTreatHideAsClose(hWnd)) {
         WINDOWPLACEMENT modified = *placement;
@@ -12850,7 +13214,15 @@ BOOL WINAPI SetWindowPlacement_Hook(HWND hWnd, const WINDOWPLACEMENT* placement)
         if (RunCloseAnimation(hWnd, ANIM_DEFER_SW_HIDE)) return TRUE;
         return ShowWindow_Original(hWnd, SW_HIDE);
     }
-    return SetWindowPlacement_Original(hWnd, placement);
+    const BOOL result = SetWindowPlacement_Original(hWnd, placement);
+    if (resizeAnimation.active) {
+        if (result) {
+            CommitResizeAnimation(&resizeAnimation, maximizing);
+        } else {
+            CancelResizeAnimation(&resizeAnimation);
+        }
+    }
+    return result;
 }
 BOOL WINAPI CloseWindow_Hook(HWND hWnd) {
     NativeMinimizeBarrier* barrier = CreateNativeMinimizeBarrier();
@@ -13063,6 +13435,7 @@ BOOL Wh_ModInit() {
     LoadAnimSettings();
     if (!g_minimizeAnimation.load(std::memory_order_relaxed) &&
         !g_restoreAnimation.load(std::memory_order_relaxed) &&
+        !g_maximizeAnimation.load(std::memory_order_relaxed) &&
         !g_closeAnimation.load(std::memory_order_relaxed) &&
         !g_switchAnimation.load(std::memory_order_relaxed) &&
         !g_launchAnimation.load(std::memory_order_relaxed)) {
@@ -13096,6 +13469,7 @@ BOOL Wh_ModInit() {
         }
     }
     WindhawkUtils::SetFunctionHook(DefWindowProcW, DefWindowProcW_Hook, &DefWindowProcW_Original);
+    WindhawkUtils::SetFunctionHook(DefWindowProcA, DefWindowProcA_Hook, &DefWindowProcA_Original);
     WindhawkUtils::SetFunctionHook(ShowWindow, ShowWindow_Hook, &ShowWindow_Original);
     WindhawkUtils::SetFunctionHook(ShowWindowAsync, ShowWindowAsync_Hook, &ShowWindowAsync_Original);
     WindhawkUtils::SetFunctionHook(SetWindowPlacement, SetWindowPlacement_Hook, &SetWindowPlacement_Original);
