@@ -2,7 +2,7 @@
 // @id              windows-animations
 // @name            Windows Animations
 // @description     Smooth minimize, restore, close, switch animations for windows.
-// @version         1.3.5
+// @version         1.3.6
 // @author          ReDrag
 // @github          https://github.com/redrag2105
 // @donateUrl       https://ko-fi.com/redrag2105
@@ -185,6 +185,8 @@ You can deeply customize the feel and pacing of every animation via the Windhawk
 * **Animate windows hidden to the tray:** Off by default. Enable it to animate apps such as Discord, Steam, and Telegram when they hide their window instead of closing it. This can also animate splash screens or windows hidden automatically by an app.
 * **Toggles:** Individually turn on/off Minimize, Restore, Maximize, Close, Alt+Tab Switch, and Launch animations to suit your workflow.
 * **Smooth maximize and unmaximize:** Optionally animate normal windows as they expand to their maximized bounds or return to their previous size. The effect uses a click-through DWM thumbnail on a worker thread, so the application keeps processing messages throughout the transition.
+
+  ![Maximize and unmaximize preview](https://raw.githubusercontent.com/Aayushjoshi12/windhawk-mods/macmotion-full-app-effects/assets/macmotion-preview.gif)
 * **Taskbar placement:** Bottom, top, left, and right taskbars are supported, including taskbars on secondary monitors and auto-hidden taskbars. Genie bends toward the detected edge and targets the app button on that axis; Windows 10 scales toward the full button position. The other minimize/restore effects animate in place, while **None** continues to use Windows' native transition.
 * **Rounded corners:** Minimize, restore, and launch effects preserve Windows 11's rounded window silhouette. Maximized windows and apps that explicitly request square corners stay square. This does not add a synthetic window shadow.
 * **Hybrid GPU acceleration:** Separate toggles allow the mod to use GPU rendering where it is measurably beneficial. The minimize/restore toggle accelerates restores and launches; normal minimizes intentionally remain on CPU. The close toggle accelerates only sufficiently large 1 px Thanos/Perlin workloads; ordinary close effects remain on CPU. Turn a toggle off to force that whole group to CPU. See **Why 1.3.5 uses a hybrid renderer** above for the complete routing rules and fallbacks.
