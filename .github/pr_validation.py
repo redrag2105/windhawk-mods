@@ -5,6 +5,7 @@ PURPOSE:     Verifies the mod information in the modified mods.
 COPYRIGHT:   Copyright 2023 Mark Jansen <mark.jansen@reactos.org>
 '''
 
+import hashlib
 import http.client
 import json
 import math
@@ -25,6 +26,7 @@ from typing import Callable, Optional, TextIO, Tuple
 import yaml
 
 from extract_mod_symbols import get_mod_symbols
+from preprocessor import blank_comments, get_literal_spans
 
 DISALLOWED_AUTHORS = [
     # https://github.com/ramensoftware/windhawk-mods/pull/676
@@ -840,7 +842,8 @@ class ModMetadataValidator:
 
     def validate_tool_mod(self):
         """Validate the metadata of a tool mod: one that targets windhawk.exe
-        with a WhTool_ModInit entry point, or any windhawk-*.exe process."""
+        with a WhTool_ModInit entry point or a -tool-mod launcher, or any
+        windhawk-*.exe process."""
         prop = self.property('include')
         if not prop:
             return
@@ -849,9 +852,13 @@ class ModMetadataValidator:
         windhawk_includes = {
             x for x in includes if re.fullmatch(r'windhawk(-[\w-]+)?\.exe', x)
         }
+        defines_tool_mod_init = (
+            re.search(r'\bWhTool_ModInit\s*\([^)]*\)\s*\{', self.mod_source)
+            is not None
+        )
         is_tool_mod = any(x != 'windhawk.exe' for x in windhawk_includes) or (
             'windhawk.exe' in windhawk_includes
-            and re.search(r'\bWhTool_ModInit\b', self.mod_source) is not None
+            and (defines_tool_mod_init or '-tool-mod' in self.mod_source)
         )
         if not is_tool_mod:
             return
@@ -861,6 +868,12 @@ class ModMetadataValidator:
                 'Tool mods must @@ exactly one of the following combinations of'
                 ' Windhawk processes:\n'
                 + '\n'.join(f'* {", ".join(x)}' for x in TOOL_MOD_ALLOWED_INCLUDES)
+            )
+        elif windhawk_includes == {'windhawk.exe'} and not defines_tool_mod_init:
+            prop.warn(
+                'Tool mods which @@ only windhawk.exe must define'
+                ' WhTool_ModInit, use the tool mod template:'
+                ' https://github.com/ramensoftware/windhawk/wiki/Mods-as-tools:-Running-mods-in-a-dedicated-process'
             )
 
         arch_prop = self.property('architecture')
@@ -1029,9 +1042,10 @@ def validate_readme(path: Path, mod_source: str) -> int:
 
 # Must match the patterns in scripts/archive_mod_images.py, which archives the
 # README images at the URL-derived paths. The script's image pattern is this one
-# restricted to the supported hosts.
+# restricted to the supported hosts. The image description excludes brackets so
+# that an unclosed one doesn't extend into the next link or image.
 ARCHIVED_README_PATTERN = r'^//[ \t]+==WindhawkModReadme==[ \t]*$\s*/\*\s*([\s\S]+?)\s*\*/\s*^//[ \t]+==/WindhawkModReadme==[ \t]*$'
-ARCHIVED_IMAGE_URL_PATTERN = r'!\[[^\]]*\]\(\s*([^)]+?)\s*\)'
+ARCHIVED_IMAGE_URL_PATTERN = r'!\[[^\[\]]*\]\(\s*([^)]+?)\s*\)'
 ARCHIVED_IMAGE_HOSTS = ['i.imgur.com', 'raw.githubusercontent.com']
 
 # Images under this prefix are shown from their original URL instead of the
@@ -1041,6 +1055,15 @@ DIRECTLY_SERVED_IMAGE_URL_PREFIX = 'https://raw.githubusercontent.com/ramensoftw
 # The archive runs on Windows, and the images folder is several directories
 # deep, so the path is kept well within MAX_PATH.
 ARCHIVED_IMAGE_MAX_PATH_LENGTH = 200
+
+# Must match LOSSY_GIF_MIN_SIZE in scripts/archive_mod_images.py. GIFs this large
+# are compressed lossily when archived.
+LARGE_GIF_MIN_SIZE = 20 * 1024 * 1024
+LARGE_ANIMATED_WEBP_MIN_SIZE = 20 * 1024 * 1024
+LARGE_IMAGE_MIN_SIZE = 2 * 1024 * 1024
+
+# Must match ORIGINAL_HASHES_FILE_NAME in scripts/archive_mod_images.py.
+ARCHIVED_ORIGINAL_HASHES_PATH = 'original_hashes.json'
 
 WINDOWS_RESERVED_FILE_NAMES = {
     'CON', 'PRN', 'AUX', 'NUL',
@@ -1084,6 +1107,52 @@ def get_archived_image(path: str) -> Optional[bytes]:
         raise
 
 
+def get_large_image_warning(image: bytes) -> Optional[str]:
+    """Return why the image is too large, or None if it isn't."""
+    size = len(image)
+    size_mb = f'{size / (1024 * 1024):.1f} MB'
+
+    if image.startswith((b'GIF87a', b'GIF89a')):
+        if size < LARGE_GIF_MIN_SIZE:
+            return None
+        return (
+            f'GIF is {size_mb}. GIFs of {LARGE_GIF_MIN_SIZE // (1024 * 1024)} MB'
+            ' or more are compressed lossily when archived, consider making it'
+            ' smaller, e.g. with a lower resolution or frame rate, or a shorter clip'
+        )
+
+    # An extended WebP file with the animation flag set.
+    if (
+        image[:4] == b'RIFF'
+        and image[8:16] == b'WEBPVP8X'
+        and len(image) > 20
+        and image[20] & 0x02
+    ):
+        if size < LARGE_ANIMATED_WEBP_MIN_SIZE:
+            return None
+        return (
+            f'Animated WebP is {size_mb}, consider making it smaller (under'
+            f' {LARGE_ANIMATED_WEBP_MIN_SIZE // (1024 * 1024)} MB), e.g. with a'
+            ' lower resolution or frame rate, or a shorter clip'
+        )
+
+    if size < LARGE_IMAGE_MIN_SIZE:
+        return None
+    return (
+        f'Image is {size_mb}, consider making it smaller (under'
+        f' {LARGE_IMAGE_MIN_SIZE // (1024 * 1024)} MB), e.g. with a lower'
+        ' resolution'
+    )
+
+
+@cache
+def get_archived_original_hashes() -> dict[str, str]:
+    """Return the SHA-256 of the original of each compressed archived image, by
+    its path relative to the images folder."""
+    data = get_archived_image(ARCHIVED_ORIGINAL_HASHES_PATH)
+    return json.loads(data) if data is not None else {}
+
+
 def validate_readme_images(path: Path, mod_source: str) -> int:
     """Validate that the README images can be archived, and that the already
     archived ones are unchanged."""
@@ -1105,8 +1174,19 @@ def validate_readme_images(path: Path, mod_source: str) -> int:
             ' image syntax: ![description](url)',
         )
 
+    image_matches = list(re.finditer(ARCHIVED_IMAGE_URL_PATTERN, readme))
+
+    image_starts = {match.start() for match in image_matches}
+    for match in re.finditer(r'!\[', readme):
+        if match.start() not in image_starts:
+            warnings += add_warning(
+                path,
+                line_of(match.start()),
+                'Malformed Markdown image, expected: ![description](url)',
+            )
+
     hosts = ', '.join(ARCHIVED_IMAGE_HOSTS)
-    for match in re.finditer(ARCHIVED_IMAGE_URL_PATTERN, readme):
+    for match in image_matches:
         url = match.group(1)
         line = line_of(match.start(1))
 
@@ -1141,8 +1221,20 @@ def validate_readme_images(path: Path, mod_source: str) -> int:
         if url.startswith(DIRECTLY_SERVED_IMAGE_URL_PREFIX):
             continue
 
-        archived_image = get_archived_image(image_path)
-        if archived_image is not None and archived_image != image:
+        original_hash = get_archived_original_hashes().get(image_path)
+        if original_hash is not None:
+            # The archived copy is compressed, so the original's hash is compared.
+            archived = True
+            changed = hashlib.sha256(image).hexdigest() != original_hash
+        else:
+            archived_image = get_archived_image(image_path)
+            archived = archived_image is not None
+            changed = archived and archived_image != image
+
+        if not archived and (large_image_warning := get_large_image_warning(image)):
+            warnings += add_warning(path, line, f'{large_image_warning}: "{url}"')
+
+        if changed:
             warnings += add_warning(
                 path,
                 line,
@@ -1701,6 +1793,73 @@ def validate_specific_keywords(path: Path, mod_source: str):
     return warnings
 
 
+MAX_LINE_LENGTH = 4096
+
+# A single long statement, such as a function call with many arguments, is
+# allowed. Only lines which pack several statements are limited.
+DENSE_CODE_LINE_MIN_STATEMENTS = 3
+DENSE_CODE_LINE_MAX_LENGTH = 150
+
+
+def get_code_lines(mod_source: str) -> list[str]:
+    """The lines of the source without comments, with each string or character
+    literal and each run of spaces and tabs shortened to a single character."""
+    code = blank_comments(mod_source)
+    parts = []
+    copied = 0
+    for start, end in get_literal_spans(code):
+        # Newlines inside a literal are kept so that the line numbers match.
+        parts.append(code[copied:start] + '"' + '\n' * code.count('\n', start, end))
+        copied = end
+    parts.append(code[copied:])
+    return re.sub(r'[ \t]+', ' ', ''.join(parts)).split('\n')
+
+
+def count_statements(code_line: str) -> int:
+    """The number of statements in the line, counted as the semicolons outside
+    of parentheses and brackets."""
+    depth = 0
+    statements = 0
+    for c in code_line:
+        if c in '([':
+            depth += 1
+        elif c in ')]':
+            depth = max(0, depth - 1)
+        elif c == ';' and depth == 0:
+            statements += 1
+    return statements
+
+
+def validate_line_lengths(path: Path, mod_source: str) -> int:
+    """Validate that lines, and the code in them, aren't overly long."""
+    warnings = 0
+
+    for line_num, line in enumerate(mod_source.split('\n'), start=1):
+        if len(line) > MAX_LINE_LENGTH:
+            warnings += add_warning(
+                path,
+                line_num,
+                f'Line is {len(line)} characters long, lines must not be longer'
+                f' than {MAX_LINE_LENGTH} characters',
+            )
+
+    for line_num, line in enumerate(get_code_lines(mod_source), start=1):
+        statements = count_statements(line)
+        if (
+            statements >= DENSE_CODE_LINE_MIN_STATEMENTS
+            and len(line) > DENSE_CODE_LINE_MAX_LENGTH
+        ):
+            warnings += add_warning(
+                path,
+                line_num,
+                f'Line packs {statements} statements into {len(line)} characters'
+                ' of code, which makes it difficult to review, please split it into'
+                f' multiple lines.',
+            )
+
+    return warnings
+
+
 def normalize_callback_param_types(params: str) -> str:
     """Strip parameter names and normalize whitespace/pointer style in a C parameter list."""
     p = re.sub(r'\s+', ' ', params.strip())
@@ -1793,6 +1952,7 @@ def validate_mod_file(path: Path, pr_author: str, pr_author_id: Optional[int]) -
     warnings += validate_settings(path, mod_source)
     warnings += validate_symbol_hooks(path, mod_source)
     warnings += validate_specific_keywords(path, mod_source)
+    warnings += validate_line_lengths(path, mod_source)
     warnings += validate_callback_signatures(path, mod_source)
 
     return warnings
